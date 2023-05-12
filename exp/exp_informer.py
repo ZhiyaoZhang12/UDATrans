@@ -74,15 +74,7 @@ class Exp_Informer(Exp_Basic):
                 self.args.mix,
                 self.device
             ).float()
-       
-        elif self.args.model == 'biLSTM':
-            model = model_dict[self.args.model](input_size=self.args.enc_in,hidden_size=512,
-                                                num_layers=5,output_size=self.args.c_out,seq_len=self.args.seq_len,
-                                                out_len=self.args.pred_len).float() #hidden_size=512,num_layers=5
-            
-        elif self.args.model == 'dcnn':
-            model = model_dict[self.args.model](pred_len=self.args.pred_len).float()
-            
+         
             
         if self.args.use_multi_gpu and self.args.use_gpu:
             model = nn.DataParallel(model, device_ids=self.args.device_ids)
