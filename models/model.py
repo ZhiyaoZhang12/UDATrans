@@ -7,9 +7,10 @@ from models.encoder import Encoder, EncoderLayer, ConvLayer, EncoderStack
 from models.decoder import Decoder, DecoderLayer
 from models.attn import FullAttention, ProbAttention, AttentionLayer
 from models.embed import DataEmbedding
+from models.functions import ReverseLayerF
 
 class Informer(nn.Module):
-    def __init__(self, args, OP_features, c_out, seq_len, label_len, out_len, is_perception,
+    def __init__(self, args, OP_features, c_out, seq_len, 
                 factor=5, d_model=512, n_heads=8, e_layers=3, d_layers=2, d_ff=512, 
                 dropout=0.0, attn='prob', embed='fixed', activation='gelu', 
                 output_attention = False, distil=True, mix=True,
@@ -21,24 +22,22 @@ class Informer(nn.Module):
 
         elif OP_features == False:
             enc_in, dec_in = 14,14
-      
+            
+        
         self.args = args
         self.seq_len = seq_len
-        self.pred_len = out_len
-        self.label_len = label_len
-        self.is_perception = is_perception   
         self.attn = attn
         self.output_attention = output_attention
         
         self.dropout = nn.Dropout(self.args.dropout)  
-
-        # Encoding
-        self.enc_embedding = DataEmbedding(enc_in, d_model, embed, dropout)
-        self.dec_embedding = DataEmbedding(dec_in, d_model, embed, dropout)
         # Attention
         Attn = ProbAttention if attn=='prob' else FullAttention
-        # Encoder
-        self.encoder = Encoder(
+        
+        # Encoding
+        self.enc_embedding = DataEmbedding(enc_in, d_model, embed, dropout)
+        
+        # Private Encoder
+        self.encoder_private = Encoder(
             [
                 EncoderLayer(
                     AttentionLayer(Attn(False, factor, attention_dropout=dropout, output_attention=output_attention), 
@@ -56,14 +55,51 @@ class Informer(nn.Module):
             ] if distil else None,
             norm_layer=torch.nn.LayerNorm(d_model)
         )
-        # Decoder
+        
+        # Share Encoder
+        self.encoder_share = Encoder(
+            [
+                EncoderLayer(
+                    AttentionLayer(Attn(False, factor, attention_dropout=dropout, output_attention=output_attention), 
+                                d_model, n_heads, mix=False),
+                    d_model,
+                    d_ff,
+                    dropout=dropout,
+                    activation=activation
+                ) for l in range(e_layers)
+            ],
+            [
+                ConvLayer(
+                    d_model
+                ) for l in range(e_layers-1)
+            ] if distil else None,
+            norm_layer=torch.nn.LayerNorm(d_model)
+        )
+        
+        '''
+        #FCL RUL predictor
+        self.RUL_predictor = nn.Sequential()
+        self.RUL_predictor.add_module('r_fc1',nn.Linear(d_model,256))
+        self.RUL_predictor.add_module('r_bn1', nn.BatchNorm1d(self.seq_len))
+        self.RUL_predictor.add_module('r_relu1', nn.ReLU(True))
+        self.RUL_predictor.add_module('r_drop1', nn.Dropout())
+        self.RUL_predictor.add_module('r_fc2', nn.Linear(256, 128))
+        self.RUL_predictor.add_module('r_bn2', nn.BatchNorm1d(self.seq_len))
+        self.RUL_predictor.add_module('r_relu2', nn.ReLU(True))
+        self.RUL_predictor.add_module('r_drop2', nn.Dropout())
+        self.RUL_predictor.add_module('r_fc3', nn.Linear(128, 64))
+        self.RUL_predictor.add_module('r_fc4', nn.Linear(64, 1))
+        '''
+        
+        #decoder RUL predictor
+        # Decoder   
         self.decoder = Decoder(
             [
                 DecoderLayer(
                     AttentionLayer(Attn(True, factor, attention_dropout=dropout, output_attention=False), 
-                                d_model, n_heads, mix=mix),
+                                d_model, n_heads, mix=mix),  #d_model
                     AttentionLayer(FullAttention(False, factor, attention_dropout=dropout, output_attention=False), 
-                                d_model, n_heads, mix=False),
+                                d_model, n_heads, mix=False),  #d_model
                     d_model,
                     d_ff,
                     dropout=dropout,
@@ -73,236 +109,69 @@ class Informer(nn.Module):
             ],
             norm_layer=torch.nn.LayerNorm(d_model)
         )
-
-
-        d_fmap = 256   #bsx(*)x512  -->  bsx(*)x256
-        self.features = nn.Linear(d_model, d_fmap, bias=True)  #fearure map
+        self.projection1 = nn.Linear(d_model, 128, bias=True) #d_model
+        self.projection2 = nn.Linear(128, 64, bias=True) #d_model
+        self.projection3 = nn.Linear(64, 1, bias=True)
+        self.relu = nn.ReLU(True)
         
-        if self.args.fmap == True:
-            d_projection,d_rul_in,d_soh_in = d_fmap,d_fmap,d_fmap  ##bsx(*)x256
-        elif self.args.fmap == False:
-            d_projection,d_rul_in,d_soh_in = d_model,d_model,d_model  ##bsx(*)x512  
-        if self.args.MTLtype == 'hierarchy':
-            d_projection = d_model   #层次的时候，一定有decoder， 此时 d_projection只等于d_model
         
-
-        #HI
-        self.projection = nn.Linear(d_projection, c_out, bias=True)
-        
-        #RUL
-        hidden_size_rul1, hidden_size_rul2 = 128, 64    #d_model 512
-        self.FC1 = nn.Linear(d_rul_in, hidden_size_rul1, bias=True)  
-        self.FC2 = nn.Linear(hidden_size_rul1, hidden_size_rul2, bias=True)
-        self.FC3 = nn.Linear(hidden_size_rul2, 1, bias=True)
-        
-        ##MTL  seq_len48对应24    32对应16   36对应18     bs*seq_len*d_model
-        #enc_out_size =  int(self.seq_len/2)   
-        
-        #SOH
-        hidden_size_soh = 128
-        self.SOH_fcl = nn.Linear(d_soh_in,hidden_size_soh)  
-        self.SOH_fc2 = nn.Linear(hidden_size_soh,3)  
-        #LayerNormal
-        self.lnorm =  nn.LayerNorm(d_soh_in)
-        self.lnorm_soh = nn.LayerNorm(3)
-        #BatchNormal
-        self.bnorm_soh = nn.BatchNorm1d(d_model)
+        #domain classifier
+        self.domain_classifier = nn.Sequential()
+        self.domain_classifier.add_module('c_fc1', nn.Linear(d_model, 128))
+        self.domain_classifier.add_module('c_bn1', nn.BatchNorm1d(18))
+        self.domain_classifier.add_module('c_relu1', nn.ReLU(True))
+        self.domain_classifier.add_module('c_drop1', nn.Dropout())
+        self.domain_classifier.add_module('c_fc2', nn.Linear(128, 64))
+        self.domain_classifier.add_module('c_bn2', nn.BatchNorm1d(18))
+        self.domain_classifier.add_module('c_relu2', nn.ReLU(True))
+        self.domain_classifier.add_module('c_fc3', nn.Linear(64, 1))
+        self.domain_classifier.add_module('c_softmax', nn.LogSoftmax(dim=1))
 
         
+        #domain discriminator
+        self.domain_discriminator = nn.Sequential()
+        self.domain_discriminator.add_module('d_fc1', nn.Linear(d_model, 128))
+        self.domain_discriminator.add_module('d_bn1', nn.BatchNorm1d(18))
+        self.domain_discriminator.add_module('d_relu1', nn.ReLU(True))
+        self.domain_discriminator.add_module('d_fc2', nn.Linear(128, 64))
+        self.domain_discriminator.add_module('d_bn2', nn.BatchNorm1d(18))
+        self.domain_discriminator.add_module('d_relu2', nn.ReLU(True))
+        self.domain_discriminator.add_module('d_fc3', nn.Linear(64, 1))
+        self.domain_discriminator.add_module('d_softmax', nn.LogSoftmax(dim=1))
+ 
         
-    def forward(self, x_enc,  x_dec,  
+        
+    def forward(self, x, flag, alpha,
                 enc_self_mask=None, dec_self_mask=None, dec_enc_mask=None):
-        enc_out = self.enc_embedding(x_enc)  
-        enc_out, attns = self.encoder(enc_out, attn_mask=enc_self_mask) 
-        #enc_out size  bs*seq_len/2*d_model  64*24*512
         
-        if self.args.MTLtype=='hard':       
-            if self.args.decoder==False:
-                if self.args.fmap==True:
-                    enc_out = self.features(enc_out)
-
-                Y_RUL = self.dropout(self.FC1(enc_out))
-                Y_RUL = self.dropout(self.FC2(Y_RUL))
-                Y_RUL = self.FC3(Y_RUL)
-                Y_RUL = Y_RUL[:,-1,:]
-                
-                if self.args.loss_weight == [0,1,0]:
-                    return Y_RUL 
-                
-                Y_HI = self.projection(enc_out)
-
-                Y_SOH = self.lnorm(enc_out)
-                Y_SOH = self.SOH_fcl(Y_SOH)  #BS*(*)*hidden_size_soh
-                Y_SOH = self.SOH_fc2(Y_SOH)  #BS*(*)*3
-                Y_SOH = self.lnorm_soh(Y_SOH)
-                Y_SOH = F.log_softmax(Y_SOH, dim=1)  #softmax   bs*3    
-                Y_SOH = Y_SOH[:,-1,:]
-            
-            elif self.args.decoder==True:
-                dec_out = self.dec_embedding(x_dec)
-                dec_out = self.decoder(dec_out, enc_out, x_mask=dec_self_mask, cross_mask=dec_enc_mask) 
-
-                if self.args.fmap==True:
-                    dec_out = self.features(dec_out)
-                
-                Y_RUL = self.dropout(self.FC1(dec_out))
-                Y_RUL = self.dropout(self.FC2(Y_RUL))
-                Y_RUL = self.FC3(Y_RUL)
-                Y_RUL = Y_RUL[:,-1,:]
-                
-                if self.args.loss_weight==[0,1,0]:
-                    return Y_RUL  
-
-                #task HI
-                Y_HI = self.projection(dec_out)
-                
-                #Task SOH
-                Y_SOH = self.lnorm(dec_out)
-                Y_SOH = self.SOH_fcl(Y_SOH)  #BS*(*)*hidden_size_soh
-                Y_SOH = self.SOH_fc2(Y_SOH)  #BS*(*)*3
-                Y_SOH = self.lnorm_soh(Y_SOH)
-                Y_SOH = F.log_softmax(Y_SOH, dim=1)  #softmax   bs*3    
-                Y_SOH = Y_SOH[:,-1,:]
-                
-            if self.output_attention==True:
-                if self.is_perception == False:
-                    Y_HI = Y_HI[:,-self.pred_len:,:]
-                elif self.is_perception == True:
-                    Y_HI = Y_HI[:,(-self.pred_len-self.label_len):,:]
-                return Y_HI, Y_SOH, Y_RUL, attns 
-
-            elif self.output_attention==False:
-                if self.is_perception == False:
-                    Y_HI = Y_HI[:,-self.pred_len:,:] # [B, L, D]
-                elif self.is_perception == True:
-                    Y_HI = Y_HI[:,(-self.pred_len-self.label_len):,:] # [B, L, D]            
-                return Y_HI, Y_SOH, Y_RUL
+        #embedding
+        x_emd = self.enc_embedding(x) 
+  
+        #private encoder & share encoder
+        private_feature, private_attns = self.encoder_private(x_emd, attn_mask=enc_self_mask)  #out size  bs*seq_len/2*d_model  64*24*512
+        share_feature, share_attns = self.encoder_share(x_emd, attn_mask=enc_self_mask) 
         
-        elif self.args.MTLtype == 'hierarchy': #先soh和rul 再hi           
-            dec_out = self.dec_embedding(x_dec)
-            dec_out = self.decoder(dec_out, enc_out, x_mask=dec_self_mask, cross_mask=dec_enc_mask)
-            
-            Y_HI = self.projection(dec_out)
-            
-            if self.args.fmap==True:
-                enc_out = self.features(enc_out)
-
-            Y_RUL = self.dropout(self.FC1(enc_out))
-            Y_RUL = self.dropout(self.FC2(Y_RUL))
-            Y_RUL = self.FC3(Y_RUL)
-            Y_RUL = Y_RUL[:,-1,:]
-
-            Y_SOH = self.lnorm(enc_out)
-            Y_SOH = self.SOH_fcl(Y_SOH)  #BS*(*)*hidden_size_soh
-            Y_SOH = self.SOH_fc2(Y_SOH)  #BS*(*)*3
-            Y_SOH = self.lnorm_soh(Y_SOH)
-            Y_SOH = F.log_softmax(Y_SOH, dim=1)  #softmax   bs*3    
-            Y_SOH = Y_SOH[:,-1,:]
-      
-            
-            if self.output_attention==True:
-                if self.is_perception == False:
-                    Y_HI = Y_HI[:,-self.pred_len:,:]
-                elif self.is_perception == True:
-                    Y_HI = Y_HI[:,(-self.pred_len-self.label_len):,:]
-                return Y_HI, Y_SOH, Y_RUL, attns 
-
-            elif self.output_attention==False:
-                if self.is_perception == False:
-                    Y_HI = Y_HI[:,-self.pred_len:,:] # [B, L, D]
-                elif self.is_perception == True:
-                    Y_HI = Y_HI[:,(-self.pred_len-self.label_len):,:] # [B, L, D]            
-                return Y_HI, Y_SOH, Y_RUL
-
-
-class InformerStack(nn.Module):
-    def __init__(self, OP_features, c_out, seq_len, label_len, out_len, is_perception,
-                factor=5, d_model=512, n_heads=8, e_layers=[3,2,1], d_layers=2, d_ff=512, 
-                dropout=0.0, attn='prob', embed='fixed', freq='h', activation='gelu',
-                output_attention = False, distil=True, mix=True,
-                device=torch.device('cuda:0')):
-        super(InformerStack, self).__init__()
+        #RUL predictor
+        #features = torch.cat((private_feature,share_feature),dim=1)  
+        #Y_RUL = self.RUL_predictor(features)
+        Y_RUL = self.decoder(private_feature,share_feature, x_mask=dec_self_mask, cross_mask=dec_enc_mask)
+        #Y_RUL = self.decoder(x_emd,features, x_mask=dec_self_mask, cross_mask=dec_enc_mask)
+        Y_RUL = self.dropout(self.projection1(Y_RUL))
+        Y_RUL = self.dropout(self.projection2(Y_RUL))
+        Y_RUL = self.projection3(Y_RUL)
+        Y_RUL = Y_RUL[:,-1,:]
         
-        if OP_features == True:
-            enc_in = 20
-        elif OP_features == False:
-            dec_in = 14
+        #domain classifier
+        class_output = self.domain_classifier(private_feature)
         
-        self.pred_len = out_len
-        self.attn = attn
-        self.output_attention = output_attention
-        self.is_perception = is_perception
+        #domain discriminator
+        if flag in ['train_source','train_target']:
+            share_feature = ReverseLayerF.apply(share_feature, alpha)
+        domain_output = self.domain_discriminator(share_feature)
+                  
+        return Y_RUL, class_output, domain_output, share_feature, private_feature
 
-        # Encoding
-        self.enc_embedding = DataEmbedding(enc_in, d_model, embed, dropout)
-        self.dec_embedding = DataEmbedding(dec_in, d_model, embed, dropout)
-        # Attention
-        Attn = ProbAttention if attn=='prob' else FullAttention
-        # Encoder
 
-        inp_lens = list(range(len(e_layers))) # [0,1,2,...] you can customize here
-        encoders = [
-            Encoder(
-                [
-                    EncoderLayer(
-                        AttentionLayer(Attn(False, factor, attention_dropout=dropout, output_attention=output_attention), 
-                                    d_model, n_heads, mix=False),
-                        d_model,
-                        d_ff,
-                        dropout=dropout,
-                        activation=activation
-                    ) for l in range(el)
-                ],
-                [
-                    ConvLayer(
-                        d_model
-                    ) for l in range(el-1)
-                ] if distil else None,
-                norm_layer=torch.nn.LayerNorm(d_model)
-            ) for el in e_layers]
-        self.encoder = EncoderStack(encoders, inp_lens)
-        # Decoder
-        self.decoder = Decoder(
-            [
-                DecoderLayer(
-                    AttentionLayer(Attn(True, factor, attention_dropout=dropout, output_attention=False), 
-                                d_model, n_heads, mix=mix),
-                    AttentionLayer(FullAttention(False, factor, attention_dropout=dropout, output_attention=False), 
-                                d_model, n_heads, mix=False),
-                    d_model,
-                    d_ff,
-                    dropout=dropout,
-                    activation=activation,
-                )
-                for l in range(d_layers)
-            ],
-            norm_layer=torch.nn.LayerNorm(d_model)
-        )
-        # self.end_conv1 = nn.Conv1d(in_channels=label_len+out_len, out_channels=out_len, kernel_size=1, bias=True)
-        # self.end_conv2 = nn.Conv1d(in_channels=d_model, out_channels=c_out, kernel_size=1, bias=True)
-        self.projection = nn.Linear(d_model, c_out, bias=True)
         
-    def forward(self, x_enc, x_dec, 
-                enc_self_mask=None, dec_self_mask=None, dec_enc_mask=None):
-        enc_out = self.enc_embedding(x_enc)
-        enc_out, attns = self.encoder(enc_out, attn_mask=enc_self_mask)
-
-        dec_out = self.dec_embedding(x_dec)
-        dec_out = self.decoder(dec_out, enc_out, x_mask=dec_self_mask, cross_mask=dec_enc_mask)
-        dec_out = self.projection(dec_out)
         
-        # dec_out = self.end_conv1(dec_out)
-        # dec_out = self.end_conv2(dec_out.transpose(2,1)).transpose(1,2)
-        if self.output_attention:
-            if self.is_perception == False:
-                return dec_out[:,-self.pred_len:,:], attns
-            elif self._perception == True:
-                 return dec_out[:,(-self.pred_len-self.label_len):,:], attns              
-        else:
-            if self.is_perception == False:
-                return dec_out[:,-self.pred_len:,:] # [B, L, D]
-            elif self._perception == True:
-                return dec_out[:,(-self.pred_len-self.label_len):,:] # [B, L, D]
-
-           
 
